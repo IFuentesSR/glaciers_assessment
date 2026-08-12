@@ -1,0 +1,836 @@
+var geometry = ee.Geometry.Polygon(
+        [[[-70.05593539819137, -33.69841007909303],
+          [-70.05359512766677, -33.700468100972856],
+          [-70.04642508760617, -33.695515070834574],
+          [-70.04298518294603, -33.6932495306298],
+          [-70.03954525437226, -33.69583995635748],
+          [-70.03644858888146, -33.6947169217856],
+          [-70.03848164834116, -33.68979617020842],
+          [-70.03619632238691, -33.68716713777566],
+          [-70.0356597987545, -33.68483706413488],
+          [-70.03572418714073, -33.68114992454193],
+          [-70.0391359207188, -33.681319551192246],
+          [-70.03849221582382, -33.680158905851044],
+          [-70.03862098386233, -33.67899825850726],
+          [-70.03905013730471, -33.67756975371347],
+          [-70.04291251828616, -33.678641134533784],
+          [-70.04475785594873, -33.67999818745432],
+          [-70.04574493100588, -33.68149808478749]]])
+var L8 = ee.ImageCollection("LANDSAT/LC08/C02/T1_L2")
+var L9 = ee.ImageCollection("LANDSAT/LC09/C02/T1_L2")
+var L5 = ee.ImageCollection("LANDSAT/LT05/C02/T1_L2")
+var L7 = ee.ImageCollection("LANDSAT/LE07/C02/T1_L2")
+
+var INV_ASSET = 'projects/lacoloradachilesebastianm1234/assets/INV_PG_2022_v2';
+var CLASES_OBJETIVO = [
+  'GLACIAR DE VALLE',
+  'GLACIAR DE MONTAÑA',
+  'GLACIAR DE EFLUENTE',
+  'GLACIAR VALLE'
+];
+var aoi   = geometry;  
+var GEOM_ERRM = ee.ErrorMargin(5);  // margen > 0 para evitar errores buffer 0
+var glaciares = ee.FeatureCollection(INV_ASSET)
+  .filter(ee.Filter.inList('CLASIFICA', CLASES_OBJETIVO))
+  .filterBounds(aoi);
+  
+var glaciars = ee.FeatureCollection(INV_ASSET)
+  .filter(ee.Filter.inList('CLASIFICA', CLASES_OBJETIVO))
+  .filter(ee.Filter.or(ee.Filter.eq('COD_REG', '05'), ee.Filter.eq('COD_REG', '13')))
+
+
+
+var TILE_SCALE    = 16;
+var BUF_M = 500;
+var REDUCE_SCALE = 90;
+
+var start = '1984-01-01';
+var end   = '2025-12-31';
+var date  = '2019-04-05';
+
+// DEM
+var dem  = ee.Image("NASA/NASADEM_HGT/001").select('elevation');
+var terrain = ee.Terrain.products(dem);
+var slope   = terrain.select('slope').multiply(Math.PI/180);
+var aspect  = terrain.select('aspect').multiply(Math.PI/180);
+
+
+var START_DATE = ee.Date(start);
+var END_DATE   = ee.Date(end);
+
+
+var set_tiles = function(img){
+  var date = ee.Date(img.get('system:time_start')).format('YYYY-MM-dd')
+  return img.set({'date': date, 
+                      'tile':ee.String(img.get('system:index')).slice(7, 13)})
+}
+
+
+function conversion(img){
+  var props = img.propertyNames()
+  var ETM_SR = ['SR_B1', 'SR_B2', 'SR_B3', 'SR_B4', 'SR_B5', 'SR_B7']
+  var LST = ['ST_B6']
+  var OLS_SR = ['SR_B2', 'SR_B3', 'SR_B4', 'SR_B5', 'SR_B6', 'SR_B7']
+  var optical = img.select(ETM_SR).multiply(0.0000275).add(-0.2);
+  var thermal = img.select(LST).multiply(0.00341802).add(149.0);
+  return img.addBands(optical.rename(OLS_SR), null, true)
+              .addBands(thermal.rename('TB'))
+              .copyProperties(img, props);
+}
+
+
+function scaleSR(image) {
+  var opticalBands = image.select('SR_B.*').multiply(0.0000275).add(-0.2);
+  var thermalBand  = image.select('ST_B10').multiply(0.00341802).add(149.0); // Kelvin
+  return image.addBands(opticalBands, null, true)
+              .addBands(thermalBand.rename('TB'))
+              .copyProperties(image, image.propertyNames());
+}
+
+
+function safeDict(d) {
+  return ee.Dictionary(ee.Algorithms.If(d, d, ee.Dictionary({})));
+}
+
+
+function dictGetOr(d, key, fallback) {
+  d = safeDict(d);
+  var v = d.get(key);
+  // OJO: si v es null, esto cae al fallback aunque la key exista
+  return ee.Number(ee.Algorithms.If(v, v, fallback));
+}
+
+
+function addSoftCloudMask(img, coverageRegion) {
+  img = ee.Image(img);
+  coverageRegion = ee.Geometry(coverageRegion);
+
+  var footprintMask = img
+    .select('SR_B3')
+    .mask()
+    .gt(0)
+    .unmask(0, false)
+    .rename('footprintMask')
+    .toFloat();
+
+  var qa = img.select('QA_PIXEL');
+
+  var cloudFree = qa
+    .bitwiseAnd(1 << 3)
+    .eq(0);
+
+  var shadowFree = qa
+    .bitwiseAnd(1 << 4)
+    .eq(0);
+
+  var qaOK = cloudFree
+    .and(shadowFree)
+    .and(footprintMask.eq(1))
+    .unmask(0, false)
+    .rename('qaOK')
+    .toFloat();
+
+  var softMask = qaOK
+    .rename('softMask')
+    .toFloat();
+
+  var lstMask = img
+    .select('TB')
+    .mask()
+    .gt(0)
+    .and(softMask.eq(1))
+    .unmask(0, false)
+    .rename('lstMask')
+    .toFloat();
+
+  var coverageStack = ee.Image.cat([
+      footprintMask,
+      softMask,
+      lstMask
+    ]);
+
+  var coverageStats = safeDict(
+    coverageStack.reduceRegion({
+      reducer: ee.Reducer.mean(),
+      geometry: coverageRegion,
+      scale: 30,
+      crs: img.select('SR_B3').projection(),
+      maxPixels: 1e13,
+      tileScale: TILE_SCALE
+    })
+  );
+
+  var footprintCover = dictGetOr(
+    coverageStats,
+    'footprintMask',
+    0
+  );
+
+  var usableCover = dictGetOr(
+    coverageStats,
+    'softMask',
+    0
+  );
+
+  var lstCover = dictGetOr(
+    coverageStats,
+    'lstMask',
+    0
+  );
+
+  var clearFractionObserved = ee.Number(
+    ee.Algorithms.If(
+      footprintCover.gt(0),
+      usableCover.divide(footprintCover),
+      0
+    )
+  );
+
+  return img
+    .addBands([
+      footprintMask,
+      qaOK,
+      softMask,
+      lstMask
+    ])
+    .updateMask(softMask)
+    .set({
+      'footprint_cover': footprintCover,
+      'clear_fraction_observed': clearFractionObserved,
+      'usable_cover': usableCover,
+      'lst_cover': lstCover,
+
+      // backward compatibility if other code still uses soft_cover
+      'soft_cover': usableCover,
+
+      'coverage_region': 'glacier_polygon',
+      'thermal_cloud_filter': 0,
+      'reduce_scale': 30
+    });
+}
+
+function topoShadow(image) {
+  var sunAz  = ee.Number(image.get('SUN_AZIMUTH'));
+  var sunEl  = ee.Number(image.get('SUN_ELEVATION'));
+  var zen    = ee.Number(90).subtract(sunEl);
+  var hs = ee.Terrain.hillShadow(dem, sunAz, zen, 5, true);
+
+  var lit    = hs.rename('lit');          // 1 = illuminated
+  var shadow = hs.not().rename('shadow'); // 1 = shadow
+
+
+  shadow = shadow.focal_max(3);
+  lit    = shadow.not().rename('lit');
+
+  return image.addBands([shadow, lit]);
+}
+
+
+function addTopoBands(image) {
+  var sunAz  = ee.Image(ee.Number(image.get('SUN_AZIMUTH')).multiply(Math.PI/180));
+  var sunEl  = ee.Image(ee.Number(image.get('SUN_ELEVATION')));
+  var zenith = ee.Image(90).subtract(sunEl).multiply(Math.PI / 180);
+
+  var cosS = zenith.cos(); // cos(zenith)
+
+  var cosI = slope.cos().multiply(zenith.cos())
+    .add(slope.sin().multiply(zenith.sin())
+    .multiply((sunAz.subtract(aspect)).cos()));
+
+  return image.addBands(cosI.rename('cosI'))
+              .addBands(cosS.rename('cosS'));
+}
+
+
+function filterMasked(image){
+  var area = glac_geom.buffer(500).area();
+  
+
+  var mask = image.select('softMask')//.gte(0.5) //////
+  image = image.updateMask(mask) ///
+
+  var imgArea = image.select('SR_B3').gt(-999)
+      .multiply(ee.Image.pixelArea())
+      .reduceRegion({reducer:ee.Reducer.sum(), geometry:glac_geom.buffer(500), scale:30, tileScale:TILE_SCALE})
+      .values().get(0);
+  var condition = ee.Algorithms.If(
+    ee.Number(imgArea).divide(area).gt(0.7),
+    image.set('return', 1),
+    image.set('return', 0)
+  );
+  return ee.Image(condition);
+}
+
+
+function cCorrection(image, correctionRegion) {
+  image = ee.Image(image);
+  correctionRegion = ee.Geometry(correctionRegion);
+
+  var bands = [
+    'SR_B2',
+    'SR_B3',
+    'SR_B4',
+    'SR_B5',
+    'SR_B6',
+    'SR_B7'
+  ];
+
+  var cosI = image.select('cosI');
+  var cosS = image.select('cosS');
+
+  var corrected = bands.map(function(bandName) {
+    var band = image.select(bandName);
+
+    var regressionMask = band.mask()
+      .and(cosI.mask())
+      .and(cosI.gt(1e-6));
+
+    // Standard C-correction regression:
+    // reflectance = slope * cosI + offset
+    var fit = ee.Dictionary(
+      cosI
+        .updateMask(regressionMask)
+        .addBands(
+          band.updateMask(regressionMask)
+        )
+        .reduceRegion({
+          reducer: ee.Reducer.linearFit(),
+          geometry: correctionRegion,
+          scale: 30,
+          bestEffort: true,
+          maxPixels: 1e13,
+          tileScale: TILE_SCALE
+        })
+    );
+
+    // Values may be null even when the corresponding key exists.
+    var rawSlope  = fit.get('scale');
+    var rawOffset = fit.get('offset');
+
+    var regressionSlope = ee.Number(
+      ee.Algorithms.If(
+        rawSlope,
+        rawSlope,
+        0
+      )
+    );
+
+    var regressionOffset = ee.Number(
+      ee.Algorithms.If(
+        rawOffset,
+        rawOffset,
+        0
+      )
+    );
+
+    var hasSlopeValue = ee.Number(
+      ee.Algorithms.If(
+        rawSlope,
+        1,
+        0
+      )
+    );
+
+    var hasOffsetValue = ee.Number(
+      ee.Algorithms.If(
+        rawOffset,
+        1,
+        0
+      )
+    );
+
+    var slopeIsNonzero = regressionSlope
+      .abs()
+      .gt(1e-6);
+
+    var hasValidFit = hasSlopeValue
+      .multiply(hasOffsetValue)
+      .multiply(slopeIsNonzero)
+      .eq(1);
+
+    // Prevent division by zero even when the fit is invalid.
+    var safeSlope = ee.Number(
+      ee.Algorithms.If(
+        slopeIsNonzero,
+        regressionSlope,
+        1
+      )
+    );
+
+    var cValue = regressionOffset.divide(
+      safeSlope
+    );
+
+    var denominator = cosI.add(cValue);
+
+    var safeDenominator = denominator.where(
+      denominator.abs().lte(1e-6),
+      1
+    );
+
+    var correctedCandidate = band
+      .multiply(
+        cosS.add(cValue)
+      )
+      .divide(
+        safeDenominator
+      )
+      .updateMask(
+        denominator.abs().gt(1e-6)
+      )
+      .unmask(band);
+
+    // If no valid regression exists, retain original reflectance.
+    var correctedBand = ee.Image(
+      ee.Algorithms.If(
+        hasValidFit,
+        correctedCandidate,
+        band
+      )
+    ).rename(
+      bandName + '_ccorr'
+    );
+
+    return correctedBand;
+  });
+
+  return image.addBands(
+    ee.Image.cat(corrected)
+  );
+}
+
+function minnaertCorrection(image, correctionRegion) {
+  image = ee.Image(image);
+  correctionRegion = ee.Geometry(correctionRegion);
+
+  var bands = [
+    'SR_B2', 'SR_B3', 'SR_B4',
+    'SR_B5', 'SR_B6', 'SR_B7'
+  ];
+
+  var cosI = image.select('cosI');
+  var cosS = image.select('cosS');
+
+  var correctedBands = bands.map(function(bandName) {
+    var band = image.select(bandName);
+
+    // Minnaert regression requires strictly positive values
+    // because logarithms are used.
+    var regressionMask = cosI.gt(1e-6)
+      .and(band.gt(0))
+      .and(cosI.mask())
+      .and(band.mask());
+
+    var logCosI = cosI
+      .updateMask(regressionMask)
+      .log();
+
+    var logBand = band
+      .updateMask(regressionMask)
+      .log();
+
+    var fit = ee.Dictionary(
+      logCosI
+        .addBands(logBand)
+        .reduceRegion({
+          reducer: ee.Reducer.linearFit(),
+          geometry: correctionRegion,
+          scale: 30,
+          bestEffort: true,
+          maxPixels: 1e13,
+          tileScale: TILE_SCALE
+        })
+    );
+
+    var scaleValue = fit.get('scale');
+
+    var hasValidScale = ee.Number(
+      ee.Algorithms.If(
+        scaleValue,
+        1,
+        0
+      )
+    );
+
+    var kRaw = ee.Number(
+      ee.Algorithms.If(
+        hasValidScale.eq(1),
+        scaleValue,
+        0
+      )
+    );
+
+    var k = kRaw.clamp(0, 2);
+
+    var denominatorValid = cosI.gt(1e-6);
+
+    var ratio = cosS.divide(
+      cosI.where(
+        denominatorValid.not(),
+        1
+      )
+    );
+
+    var correctedCandidate = band
+      .multiply(
+        ratio.pow(
+          ee.Image.constant(k)
+        )
+      )
+      .updateMask(denominatorValid)
+      .unmask(band);
+
+    var corrected = ee.Image(
+      ee.Algorithms.If(
+        hasValidScale.eq(1),
+        correctedCandidate,
+        band
+      )
+    ).rename(bandName + '_ccorr');
+
+    return corrected;
+  });
+
+  return image.addBands(
+    ee.Image.cat(correctedBands)
+  );
+}
+
+function hybridTopoCorrection(image, correctionRegion) {
+  image = ee.Image(image);
+  correctionRegion = ee.Geometry(correctionRegion);
+
+  var bands = [
+    'SR_B2', 'SR_B3', 'SR_B4',
+    'SR_B5', 'SR_B6', 'SR_B7'
+  ];
+
+  var slopeDeg = ee.Terrain.slope(dem);
+
+  var ndsi = image
+    .normalizedDifference(['SR_B3', 'SR_B6'])
+    .rename('NDSI');
+
+  var bright = ndsi.gt(0.4);
+  var steep = slopeDeg.gt(20);
+
+  var cCorr = cCorrection(
+    image,
+    correctionRegion
+  );
+
+  var mCorr = minnaertCorrection(
+    image,
+    correctionRegion
+  );
+
+  var useC = bright.and(steep.not());
+
+  var hybridBands = bands.map(function(b) {
+    var cBand = cCorr.select(b + '_ccorr');
+    var mBand = mCorr.select(b + '_ccorr');
+
+    return mBand
+      .where(useC, cBand)
+      .rename(b + '_ccorr');
+  });
+
+  return image.addBands(
+    ee.Image.cat(hybridBands)
+      .clamp(0, 1),
+    null,
+    true
+  );
+}
+
+
+var otsuThreshold = function(img, band, regionGeom) {
+  var histogram = img.select(band).reduceRegion({
+    reducer: ee.Reducer.histogram(),
+    geometry: regionGeom,
+    scale: 30,
+    bestEffort: true,
+    maxPixels: 1e13
+  }).get(band);
+
+  var counts = ee.Array(ee.Dictionary(histogram).get('histogram'));
+  var means  = ee.Array(ee.Dictionary(histogram).get('bucketMeans'));
+  var size   = means.length().get([0]);
+  var total  = counts.reduce(ee.Reducer.sum(), [0]).get([0]);
+  var sum    = means.multiply(counts).reduce(ee.Reducer.sum(), [0]).get([0]);
+  var mean   = sum.divide(total);
+
+  var indices = ee.List.sequence(1, size);
+
+  var bss = indices.map(function(i) {
+    i = ee.Number(i);
+    var aCounts = counts.slice(0, 0, i);
+    var aCount  = aCounts.reduce(ee.Reducer.sum(), [0]).get([0]);
+    var aMeans  = means.slice(0, 0, i);
+    var aMean   = aMeans.multiply(aCounts).reduce(ee.Reducer.sum(), [0]).get([0]).divide(aCount);
+
+    var bCount = total.subtract(aCount);
+    var bMean  = sum.subtract(aCount.multiply(aMean)).divide(bCount);
+
+    return aCount.multiply(aMean.subtract(mean).pow(2))
+      .add(bCount.multiply(bMean.subtract(mean).pow(2)));
+  });
+
+  return means.sort(bss).get([-1]);
+};
+
+
+function safeOtsuFromBand(img, band, region, scale, fallback) {
+  scale = scale || 90;
+  fallback = fallback || 0.45;
+
+  var h = img.select(band).reduceRegion({
+    reducer: ee.Reducer.histogram({maxBuckets: 256}),
+    geometry: region,
+    scale: scale,
+    bestEffort: true,
+    maxPixels: 1e13
+  }).get(band);
+
+  // if no histogram: fallback
+  var hasHist = ee.Number(ee.Algorithms.If(h, 1, 0));
+
+  // if histogram, but sums 0: fallback
+  var total = ee.Number(ee.Algorithms.If(hasHist,
+    ee.Array(ee.Dictionary(h).get('histogram')).reduce(ee.Reducer.sum(), [0]).get([0]),
+    0
+  ));
+
+  var ok = total.gt(0);
+
+  var thr = ee.Number(ee.Algorithms.If(ok,
+    otsuThreshold(img, band, region),
+    fallback
+  ));
+
+  return thr;
+}
+
+
+function adaptiveSnowThreshold(img, band, region, scale) {
+  scale = scale || 90;
+  var s = img.select(band);
+
+  // very snowy (if fails: 0)
+  var snowFrac = ee.Number(
+    s.gt(0.5).reduceRegion({
+      reducer: ee.Reducer.mean(),
+      geometry: region,
+      scale: scale,
+      bestEffort: true,
+      maxPixels: 1e13
+    }).get(band)
+  );
+  snowFrac = ee.Number(ee.Algorithms.If(snowFrac, snowFrac, 0));
+
+  // clamps percentiles (if fails: defaults)
+  var P = ee.Dictionary(s.reduceRegion({
+    reducer: ee.Reducer.percentile([10, 50, 90]),
+    geometry: region,
+    scale: scale,
+    bestEffort: true,
+    maxPixels: 1e13
+  }));
+
+  var p10 = ee.Number(ee.Algorithms.If(P.get(band + '_p10'), P.get(band + '_p10'), 0.25));
+  var p50 = ee.Number(ee.Algorithms.If(P.get(band + '_p50'), P.get(band + '_p50'), 0.45));
+  var p90 = ee.Number(ee.Algorithms.If(P.get(band + '_p90'), P.get(band + '_p90'), 0.65));
+
+  // Otsu safe + clamp
+  var otsuThr = safeOtsuFromBand(img, band, region, scale, p50).clamp(p10, p90);
+
+  // Switching due to dominancy
+  var thr = ee.Number(ee.Algorithms.If(
+    snowFrac.gt(0.9), 0.45,
+    ee.Algorithms.If(
+      snowFrac.lt(0.1), 0.30,
+      otsuThr
+    )
+  ));
+
+  return thr;
+}
+
+
+function addQualityBands(image) {
+  var green = image.select('SR_B3_ccorr');
+  var swir1 = image.select('SR_B6_ccorr');
+  var swir2 = image.select('SR_B7_ccorr');
+  var red   = image.select('SR_B4_ccorr');
+  var nir   = image.select('SR_B5_ccorr');
+  var ndvi = red.subtract(nir).divide(red.add(nir)).clamp(-1, 1).rename('NDVI');
+
+  var ndsi  = green.subtract(swir1).divide(green.add(swir1)).clamp(-1, 1).rename('NDSI');
+  var ndgi  = green.subtract(red  ).divide(green.add(red  )).clamp(-1, 1).rename('NDGI');
+  var ndwi  = green.subtract(nir  ).divide(green.add(nir  )).clamp(-1, 1).rename('NDWI');
+  var csi   = nir.divide(swir2).rename('CSI');
+  var andsi = csi.subtract(ndsi).divide(csi.add(ndsi)).rename('ANDSI');
+
+  var albedo = image.expression(
+    '0.356*B2 + 0.130*B3 + 0.373*B4 + 0.085*B5 + 0.072*B6 + 0.072*B7', {
+      'B2': image.select('SR_B2_ccorr'),
+      'B3': image.select('SR_B3_ccorr'),
+      'B4': image.select('SR_B4_ccorr'),
+      'B5': image.select('SR_B5_ccorr'),
+      'B6': image.select('SR_B6_ccorr'),
+      'B7': image.select('SR_B7_ccorr')
+    }).rename('Albedo');
+    
+  var vis = image.select('SR_B2_ccorr')
+    .add(image.select('SR_B3_ccorr'))
+    .add(image.select('SR_B4_ccorr'))
+    .divide(3).rename('VIS');
+  
+  var snowScore = ndsi.multiply(0.7).add(vis.unitScale(0.05, 0.6).multiply(0.3))
+    .rename('snowScore');
+  var ndsiScore   = ndsi.max(0).min(1);
+  var shadow      = image.select('shadow');
+  var lit = image.select('lit')
+  var shadowScore = shadow.not().rename('shadowScore');
+  var tb          = image.select('TB');
+  var tbNorm      = tb.unitScale(270, 320).rename('tbNorm');
+  // albedo = albedo.updateMask(ndsi.gt(0.4).and(ndvi.lt(0.2)).and(ndwi.lt(0.0))).updateMask(lit)
+  var quality = ndsiScore.multiply(0.6)
+    .add(shadowScore.multiply(0.3))
+    .add(tbNorm.multiply(0.1))
+    .rename('quality');
+
+  return image.addBands([ndsi, andsi, ndgi, ndwi, albedo, snowScore, quality]);
+}
+
+
+var pixelArea = ee.Image.pixelArea();
+var scale = 30;
+
+
+var to_drive = glaciars.map(function(feat){
+  var MIN_FOOTPRINT_COVER = 0.50;
+  var MIN_CLEAR_OBSERVED  = 0.50;
+  var MIN_USABLE_COVER    = 0.50;
+  var code_glacier = feat.get('COD_GLA')
+  var classifica = feat.get('CLASIFICA')
+  var aoic = feat.geometry()
+  var glac_geome = aoic
+  var landsat = L8.filterBounds(aoic).filterDate(start, end).merge(L9.filterBounds(aoic).filterDate(start, end)).map(set_tiles).sort('system:time_start')
+  var l2 = L7.filterBounds(aoic).filterDate(start, end).merge(L5.filterBounds(aoic).filterDate(start, end)).map(set_tiles).sort('system:time_start')
+  var paths = landsat.aggregate_array('WRS_PATH').distinct();
+  var rows = landsat.aggregate_array('WRS_ROW').distinct();
+  var tiles = landsat.aggregate_array('tile').distinct()
+  var dates = landsat.aggregate_array('date').distinct()
+  var pathCounts = landsat.aggregate_histogram('WRS_ROW');
+  var keys = pathCounts.keys();            // ee.List of keys (strings)
+  var values = pathCounts.values() // ee.List of numbers
+  var maxCount = ee.Number(values.reduce(ee.Reducer.max()));
+  var maxIndex = values.indexOf(maxCount);
+  var mostCommonPath = ee.Number.parse(ee.String(keys.get(maxIndex)));
+  landsat = landsat.filter(ee.Filter.eq('WRS_ROW', mostCommonPath));
+  l2 = l2.filter(ee.Filter.eq('WRS_ROW', mostCommonPath));
+  var processed = landsat.map(scaleSR)
+  var processed2 = l2.map(conversion)
+  processed = processed.merge(processed2).sort('system:time_start')
+  processed = processed.map(function(imge){return addSoftCloudMask(imge, aoic)})
+  .filter(ee.Filter.gte(
+    'footprint_cover',
+    MIN_FOOTPRINT_COVER
+  ))
+  .filter(ee.Filter.gte(
+    'clear_fraction_observed',
+    MIN_CLEAR_OBSERVED
+  ))
+  .filter(ee.Filter.gte(
+    'usable_cover',
+    MIN_USABLE_COVER
+  ));
+ 
+  processed = processed
+  .map(topoShadow)
+  .map(addTopoBands)
+  .map(function(imge){return hybridTopoCorrection(imge, aoic)}) //minnaertCorrection or cCorrection
+  .map(addQualityBands)
+  .sort('system:time_start');
+  var glacArea_m2 = ee.Number(ee.Image.pixelArea().rename('area').reduceRegion({
+      reducer: ee.Reducer.sum(),
+      geometry: glac_geome,
+      scale: 30,
+      maxPixels: 1e13,
+      tileScale: TILE_SCALE,
+      bestEffort: true
+  }).get('area'));
+  var pxArea = ee.Image.pixelArea();
+  var collSnowAlbedo = processed.map(function(imge){
+      var regione = glac_geome.buffer(500);
+      var snowScore = imge.select('snowScore');
+      var thr = adaptiveSnowThreshold(imge, 'snowScore', regione, 30);
+      var snow = snowScore.gt(thr).rename('snow');
+      // var snowEdge = snow.focal_max(1).neq(snow.focal_min(1)).selfMask().rename('snow_edge'); //for ELA
+      // var edgeElev = dem.updateMask(snowEdge);
+      var snowElev = dem.updateMask(snow)
+      var valid = snowScore.mask().rename('valid'); // 1 where observed, 0 where missing
+      var snowArea = snow.selfMask().multiply(pxArea).rename('snow_area_m2');
+      var validArea = valid.selfMask().multiply(pxArea).rename('valid_area_m2');
+      var albGlacier = imge.select('Albedo').updateMask(imge.select('lit')).rename('alb')
+      var albSnowLit = imge.select('Albedo').updateMask(imge.select('lit')).updateMask(snow).rename('alb_snow') 
+      var lst = imge.select('TB')
+      var stack = ee.Image.cat([albGlacier, albSnowLit, lst, snowArea, validArea, snowElev, snowElev]);
+      var r = ee.Reducer.median()
+        .combine({reducer2: ee.Reducer.median(), outputPrefix: 'alb_snow_',  sharedInputs: false})
+        .combine({reducer2: ee.Reducer.median(), outputPrefix: 'lst_',  sharedInputs: false})
+        .combine({reducer2: ee.Reducer.sum(), outputPrefix: 'snow_',  sharedInputs: false})
+        .combine({reducer2: ee.Reducer.sum(), outputPrefix: 'valid_', sharedInputs: false})
+        .combine({reducer2: ee.Reducer.median(), outputPrefix: 'snoele_',  sharedInputs: false})
+        .combine({reducer2: ee.Reducer.mean(), outputPrefix: 'snoele_',  sharedInputs: false})
+        ;
+      var stats = stack.reduceRegion({
+        reducer: r,
+        geometry: glac_geome,
+        scale: 30,
+        bestEffort: true,
+        maxPixels: 1e13,
+        tileScale: TILE_SCALE
+      });
+    
+      var albMedGlacier = stats.get('median');
+      var albMedSnow = stats.get('alb_snow_median');
+      var therm = ee.Number(stats.get('lst_median'));
+      var snowSum = ee.Number(stats.get('snow_sum'));
+      var validSum = ee.Number(stats.get('valid_sum'));
+      var eleMedian = ee.Number(stats.get('snoele_median'));
+      var eleMean = ee.Number(stats.get('snoele_mean'));
+      
+      snowSum = ee.Number(ee.Algorithms.If(snowSum, snowSum, 0));
+      validSum = ee.Number(ee.Algorithms.If(validSum, validSum, 0));
+      var frac = ee.Number(ee.Algorithms.If(validSum.gt(0), snowSum.divide(validSum), null));
+      return ee.Feature(null, {
+        'system:time_start': imge.get('system:time_start'),
+        'date': ee.Date(imge.get('system:time_start')).format('YYYY-MM-dd'),
+        'thresh': thr,
+        'albedoGlacier': albMedGlacier,
+        'albedoSnow': albMedSnow,
+        'snow_area_ha': snowSum.divide(10000),
+        'valid_area_ha': validSum.divide(10000), 
+        'fraction_area': frac,
+        'fraction_area2': snowSum.divide(glacArea_m2),
+        'lst': therm,
+        'elev_med': eleMedian,
+        'elev_mean': eleMean,
+        'code_glacier':code_glacier,
+        'clasifica':classifica,
+        'footprint_cover': imge.get('footprint_cover'),
+        'clear_fraction_observed': imge.get('clear_fraction_observed'),
+        'usable_cover': imge.get('usable_cover'),
+        'lst_cover': imge.get('lst_cover')
+         });
+    })
+    return collSnowAlbedo
+    .filter(ee.Filter.notNull(['albedoGlacier', 'fraction_area']))
+    .filter(ee.Filter.gte('valid_area_ha', 5))
+    .sort('system:time_start');
+}) 
+
+Export.table.toDrive(to_drive.flatten(), 'glacier_series2x1')
+
